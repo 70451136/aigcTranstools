@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from lxml import etree
 from zipfile import ZipFile
 from .skip_pipeline import should_translate
@@ -24,23 +25,37 @@ def extract_word_content_to_json(file_path):
     content_data = []
     item_id = 0
     
-    # Get all block elements for indexing
-    block_elements = document_tree.xpath('.//*[self::w:p or self::w:tbl]', namespaces=namespaces)
+    # Get all block elements for indexing (including SDT content)
+    all_elements = document_tree.xpath('.//*[self::w:p or self::w:tbl]', namespaces=namespaces)
     
     # Process all paragraphs and tables in main document
-    for element in block_elements:
+    for element in all_elements:
         element_type = element.tag.split('}')[-1]
-        element_index = block_elements.index(element)
+        element_index = all_elements.index(element)
         
         if element_type == 'p':
             is_heading = bool(element.xpath('.//w:pStyle[@w:val="Heading1" or @w:val="Heading2" or @w:val="Heading3"]', namespaces=namespaces))
             has_numbering = bool(element.xpath('.//w:numPr', namespaces=namespaces))
-            full_text = ""
-            runs = element.xpath('.//w:r', namespaces=namespaces)
-            for run in runs:
-                text_nodes = run.xpath('.//w:t', namespaces=namespaces)
-                for text_node in text_nodes:
-                    full_text += text_node.text if text_node.text else ""
+            
+            # Check if this is a TOC (Table of Contents) paragraph
+            is_toc = bool(element.xpath('.//w:pStyle[starts-with(@w:val, "TOC")]', namespaces=namespaces))
+            toc_level = None
+            if is_toc:
+                toc_style_nodes = element.xpath('.//w:pStyle[starts-with(@w:val, "TOC")]/@w:val', namespaces=namespaces)
+                if toc_style_nodes:
+                    toc_level = toc_style_nodes[0]
+            
+            # Extract text differently for TOC paragraphs
+            if is_toc:
+                full_text, toc_structure = extract_toc_text_with_precise_structure(element, namespaces)
+            else:
+                full_text = ""
+                runs = element.xpath('.//w:r', namespaces=namespaces)
+                for run in runs:
+                    text_nodes = run.xpath('.//w:t', namespaces=namespaces)
+                    for text_node in text_nodes:
+                        full_text += text_node.text if text_node.text else ""
+                toc_structure = None
             
             numbering_style = None
             if has_numbering:
@@ -50,7 +65,7 @@ def extract_word_content_to_json(file_path):
             
             if full_text and should_translate(full_text):
                 item_id += 1
-                content_data.append({
+                item_data = {
                     "id": item_id,
                     "count_src": item_id,
                     "type": "paragraph",
@@ -59,7 +74,18 @@ def extract_word_content_to_json(file_path):
                     "numbering_style": numbering_style,
                     "element_index": element_index,
                     "value": full_text.replace("\n", "␊").replace("\r", "␍")
-                })
+                }
+                
+                # Add TOC specific information
+                if is_toc:
+                    item_data.update({
+                        "is_toc": True,
+                        "toc_level": toc_level,
+                        "toc_structure": toc_structure
+                    })
+                
+                content_data.append(item_data)
+        
         # Process for sheet in Word
         elif element_type == 'tbl':
             table_cells = []
@@ -184,6 +210,99 @@ def extract_word_content_to_json(file_path):
     app_logger.info(f"Extracted {len(content_data)} content items from document: {filename}")
     return json_path
 
+def extract_toc_text_with_precise_structure(paragraph, namespaces):
+    """
+    从目录段落中精确提取标题文本，保存详细的结构信息
+    """
+    all_runs = paragraph.xpath('.//w:r', namespaces=namespaces)
+    
+    structure = {
+        'title_run_indices': [],    # 标题文本run的索引
+        'hyperlink_path': None,     # 超链接的XPath
+        'title_run_paths': []       # 标题run的详细路径
+    }
+    
+    title_text = ""
+    
+    # 检查是否在超链接中
+    hyperlinks = paragraph.xpath('.//w:hyperlink', namespaces=namespaces)
+    
+    if hyperlinks:
+        hyperlink = hyperlinks[0]  # 通常只有一个超链接
+        hyperlink_runs = hyperlink.xpath('.//w:r', namespaces=namespaces)
+        
+        # 在超链接的runs中找到标题文本
+        for i, run in enumerate(hyperlink_runs):
+            # 跳过包含制表符的run
+            if run.xpath('.//w:tab', namespaces=namespaces):
+                continue
+            
+            # 跳过包含字段代码的run
+            if run.xpath('.//w:fldChar | .//w:instrText', namespaces=namespaces):
+                continue
+            
+            # 获取run中的文本
+            run_text = ""
+            text_nodes = run.xpath('.//w:t', namespaces=namespaces)
+            for text_node in text_nodes:
+                if text_node.text:
+                    run_text += text_node.text
+            
+            if run_text.strip():
+                # 检查是否是编号（如"1.", "2."等）
+                if re.match(r'^\d+\.$', run_text.strip()):
+                    continue  # 跳过编号
+                
+                # 检查是否是纯数字（页码）
+                if re.match(r'^\d+$', run_text.strip()):
+                    continue  # 跳过页码
+                
+                # 这应该是标题文本
+                title_text += run_text
+                
+                # 记录这个run的位置信息
+                run_index_in_all = all_runs.index(run) if run in all_runs else -1
+                if run_index_in_all >= 0:
+                    structure['title_run_indices'].append(run_index_in_all)
+                    
+                # 记录在超链接中的位置
+                structure['title_run_paths'].append({
+                    'hyperlink_index': 0,
+                    'run_index_in_hyperlink': i,
+                    'run_index_in_paragraph': run_index_in_all
+                })
+    else:
+        # 没有超链接的情况，直接分析所有runs
+        for i, run in enumerate(all_runs):
+            # 跳过包含制表符的run
+            if run.xpath('.//w:tab', namespaces=namespaces):
+                continue
+            
+            # 跳过包含字段代码的run
+            if run.xpath('.//w:fldChar | .//w:instrText', namespaces=namespaces):
+                continue
+            
+            # 获取run中的文本
+            run_text = ""
+            text_nodes = run.xpath('.//w:t', namespaces=namespaces)
+            for text_node in text_nodes:
+                if text_node.text:
+                    run_text += text_node.text
+            
+            if run_text.strip():
+                # 检查是否是编号或页码
+                if re.match(r'^\d+\.?$', run_text.strip()):
+                    continue
+                
+                # 这应该是标题文本
+                title_text += run_text
+                structure['title_run_indices'].append(i)
+    
+    # 清理标题文本
+    title_text = title_text.strip()
+    title_text = re.sub(r'\s+', ' ', title_text)
+    
+    return title_text, structure
 
 def write_translated_content_to_word(file_path, original_json_path, translated_json_path):
     with open(original_json_path, "r", encoding="utf-8") as original_file:
@@ -215,7 +334,8 @@ def write_translated_content_to_word(file_path, original_json_path, translated_j
     for hf_file, hf_content in header_footer_files.items():
         header_footer_trees[hf_file] = etree.fromstring(hf_content)
     
-    block_elements = document_tree.xpath('.//*[self::w:p or self::w:tbl]', namespaces=namespaces)
+    # Get all block elements (including SDT content)
+    all_elements = document_tree.xpath('.//*[self::w:p or self::w:tbl]', namespaces=namespaces)
 
     # Handle paragraphs and table cells in main document
     for item in original_data:
@@ -231,17 +351,22 @@ def write_translated_content_to_word(file_path, original_json_path, translated_j
         if item["type"] == "paragraph":
             try:
                 element_index = item.get("element_index")
-                if element_index is None or element_index >= len(block_elements):
+                if element_index is None or element_index >= len(all_elements):
                     app_logger.error(f"Invalid element index: {element_index}")
                     continue
                     
-                paragraph = block_elements[element_index]
+                paragraph = all_elements[element_index]
                 
                 if paragraph.tag.split('}')[-1] != 'p':
                     app_logger.error(f"Element at index {element_index} is not a paragraph")
                     continue
                 
-                update_paragraph_text_with_formatting(paragraph, translated_text, namespaces, item.get("has_numbering", False))
+                # Special handling for TOC paragraphs
+                if item.get("is_toc", False):
+                    toc_structure = item.get("toc_structure")
+                    update_toc_paragraph_precisely(paragraph, translated_text, namespaces, toc_structure)
+                else:
+                    update_paragraph_text_with_formatting(paragraph, translated_text, namespaces, item.get("has_numbering", False))
                     
             except (IndexError, TypeError) as e:
                 app_logger.error(f"Error finding paragraph with index {item.get('element_index')}: {e}")
@@ -249,11 +374,11 @@ def write_translated_content_to_word(file_path, original_json_path, translated_j
         elif item["type"] == "table_cell":
             try:
                 table_index = item.get("table_index")
-                if table_index is None or table_index >= len(block_elements):
+                if table_index is None or table_index >= len(all_elements):
                     app_logger.error(f"Invalid table index: {table_index}")
                     continue
                 
-                table = block_elements[table_index]
+                table = all_elements[table_index]
                 
                 if table.tag.split('}')[-1] != 'tbl':
                     app_logger.error(f"Element at index {table_index} is not a table")
@@ -380,6 +505,92 @@ def write_translated_content_to_word(file_path, original_json_path, translated_j
     app_logger.info(f"Translated Word document saved to: {result_path}")
     return result_path
 
+def update_toc_paragraph_precisely(paragraph, translated_text, namespaces, toc_structure):
+    """
+    使用精确的结构信息更新目录段落的标题文本
+    """
+    if not toc_structure or not toc_structure.get('title_run_paths'):
+        # 如果没有结构信息，使用备用方法
+        update_toc_paragraph_fallback(paragraph, translated_text, namespaces)
+        return
+    
+    # 获取超链接
+    hyperlinks = paragraph.xpath('.//w:hyperlink', namespaces=namespaces)
+    
+    if hyperlinks and toc_structure.get('title_run_paths'):
+        # 使用超链接中的路径信息
+        hyperlink = hyperlinks[0]
+        hyperlink_runs = hyperlink.xpath('.//w:r', namespaces=namespaces)
+        
+        # 清除所有标题文本runs的内容
+        for path_info in toc_structure['title_run_paths']:
+            run_idx = path_info.get('run_index_in_hyperlink')
+            if run_idx is not None and run_idx < len(hyperlink_runs):
+                run = hyperlink_runs[run_idx]
+                # 清除该run中的所有文本节点
+                text_nodes = run.xpath('.//w:t', namespaces=namespaces)
+                for text_node in text_nodes:
+                    text_node.getparent().remove(text_node)
+        
+        # 在第一个标题run中添加翻译文本
+        if toc_structure['title_run_paths']:
+            first_title_run_idx = toc_structure['title_run_paths'][0].get('run_index_in_hyperlink')
+            if first_title_run_idx is not None and first_title_run_idx < len(hyperlink_runs):
+                first_run = hyperlink_runs[first_title_run_idx]
+                new_text_node = etree.SubElement(first_run, f"{{{namespaces['w']}}}t")
+                new_text_node.text = translated_text
+    else:
+        # 备用方法
+        update_toc_paragraph_fallback(paragraph, translated_text, namespaces)
+
+def update_toc_paragraph_fallback(paragraph, translated_text, namespaces):
+    """
+    备用的目录段落更新方法
+    """
+    # 检查超链接
+    hyperlinks = paragraph.xpath('.//w:hyperlink', namespaces=namespaces)
+    
+    if hyperlinks:
+        hyperlink = hyperlinks[0]
+        hyperlink_runs = hyperlink.xpath('.//w:r', namespaces=namespaces)
+        
+        # 找到包含标题文本的runs（排除编号、制表符、页码）
+        title_runs = []
+        for run in hyperlink_runs:
+            # 跳过制表符
+            if run.xpath('.//w:tab', namespaces=namespaces):
+                continue
+            
+            # 跳过字段代码
+            if run.xpath('.//w:fldChar | .//w:instrText', namespaces=namespaces):
+                continue
+            
+            # 获取文本
+            run_text = ""
+            text_nodes = run.xpath('.//w:t', namespaces=namespaces)
+            for text_node in text_nodes:
+                if text_node.text:
+                    run_text += text_node.text
+            
+            # 跳过编号和页码
+            if run_text.strip() and not re.match(r'^\d+\.?$', run_text.strip()):
+                title_runs.append(run)
+        
+        # 清除标题runs的文本
+        for run in title_runs:
+            text_nodes = run.xpath('.//w:t', namespaces=namespaces)
+            for text_node in text_nodes:
+                text_node.getparent().remove(text_node)
+        
+        # 在第一个标题run中添加翻译文本
+        if title_runs:
+            new_text_node = etree.SubElement(title_runs[0], f"{{{namespaces['w']}}}t")
+            new_text_node.text = translated_text
+    else:
+        # 处理没有超链接的TOC段落（如"目录"标题）
+        # 直接使用标准的段落文本更新方法
+        update_paragraph_text_with_formatting(paragraph, translated_text, namespaces, False)
+
 def update_paragraph_text_with_formatting(paragraph, new_text, namespaces, has_numbering=False):
     # Get all runs in the paragraph
     runs = paragraph.xpath('.//w:r', namespaces=namespaces)
@@ -400,7 +611,6 @@ def update_paragraph_text_with_formatting(paragraph, new_text, namespaces, has_n
             formatting_elements[i] = formats
     
     # Clear all existing text nodes
-    text_nodes = []
     for run in runs:
         for t in run.xpath('.//w:t', namespaces=namespaces):
             t.getparent().remove(t)
@@ -408,7 +618,6 @@ def update_paragraph_text_with_formatting(paragraph, new_text, namespaces, has_n
     # Special handling for paragraphs with numbering
     if has_numbering:
         # Try to detect numbering pattern in text
-        import re
         numbering_match = re.match(r'^(\d+[\.\)]|\w+[\.\)]|\•|\-|\*)\s+(.*)$', new_text)
         
         if numbering_match and len(runs) > 1:
@@ -436,7 +645,7 @@ def update_paragraph_text_with_formatting(paragraph, new_text, namespaces, has_n
         new_text_node = etree.SubElement(runs[0], f"{{{namespaces['w']}}}t")
         new_text_node.text = new_text
         
-        # Clear text nodes in other runs
+        # Clear text nodes in other runs but keep them for formatting
         for i in range(1, len(runs)):
             for t in runs[i].xpath('.//w:t', namespaces=namespaces):
                 if t.getparent() is not None:
@@ -490,7 +699,6 @@ def update_table_cell_text(cell, new_text, namespaces):
         new_run = etree.SubElement(new_p, f"{{{namespaces['w']}}}r")
         new_text_node = etree.SubElement(new_run, f"{{{namespaces['w']}}}t")
         new_text_node.text = new_text
-
 
 def update_json_structure_after_translation(original_json_path, translated_json_path):
     with open(original_json_path, "r", encoding="utf-8") as orig_file:
